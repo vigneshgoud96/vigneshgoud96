@@ -1,0 +1,114 @@
+name: Deploy Databricks Asset Bundle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'databricks/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'databricks/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+jobs:
+  # ── Validate (runs on every PR) ───────────────────────────────────────────
+  validate:
+    name: Validate bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          databricks --version
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt --break-system-packages
+
+      - name: Lint notebooks (flake8)
+        run: |
+          flake8 databricks/notebooks/ \
+            --max-line-length=120 \
+            --extend-ignore=E501,W503 \
+            --exclude=__pycache__
+
+      - name: Python syntax check
+        run: |
+          find databricks/notebooks -name "*.py" -exec python -m py_compile {} \;
+          echo "All notebooks pass syntax check"
+
+      - name: Databricks bundle validate (dev)
+        working-directory: databricks
+        run: databricks bundle validate --target dev
+
+      - name: Comment PR with validation result
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ **Databricks bundle validate passed** for this PR.\n\nReady for review and merge.'
+            })
+
+  # ── Deploy to staging (on PR merge to main) ──────────────────────────────
+  deploy-staging:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Databricks CLI
+        run: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+
+      - name: Deploy bundle to staging
+        working-directory: databricks
+        run: databricks bundle deploy --target staging
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_STAGING }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_STAGING }}
+
+      - name: Run integration smoke test
+        working-directory: databricks
+        run: databricks bundle run orders_medallion_pipeline --target staging
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_STAGING }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_STAGING }}
+
+  # ── Deploy to production (manual approval gate) ───────────────────────────
+  deploy-prod:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: production        # Requires manual approval in GitHub Environments
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Databricks CLI
+        run: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+
+      - name: Deploy bundle to production
+        working-directory: databricks
+        run: databricks bundle deploy --target prod
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_PROD }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_PROD }}

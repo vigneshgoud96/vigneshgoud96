@@ -1,0 +1,145 @@
+name: Deploy Azure Data Factory
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'adf/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'adf/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write      # Required for OIDC federated auth to Azure
+
+jobs:
+  # ── Validate (every PR) ───────────────────────────────────────────────────
+  validate:
+    name: Validate ADF JSON
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install jsonschema --break-system-packages
+
+      - name: Validate JSON syntax for all ADF files
+        run: |
+          find adf/ -name "*.json" | while read f; do
+            python -c "import json, sys; json.load(open('$f'))" && echo "OK: $f" || (echo "INVALID JSON: $f"; exit 1)
+          done
+
+      - name: Check required ADF fields
+        run: |
+          python scripts/validate_adf_schema.py
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ARM template validate (staging)
+        run: |
+          az deployment group validate \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP_STAGING }} \
+            --template-file scripts/adf_arm_wrapper.json \
+            --parameters factoryName=${{ secrets.ADF_FACTORY_NAME_STAGING }}
+
+      - name: Comment PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ **ADF JSON valid and ARM template validate passed** for this PR.\n\nReady for review.'
+            })
+
+  # ── Deploy to staging ─────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to ADF staging
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy pipelines to ADF staging
+        run: |
+          for f in adf/pipeline/*.json; do
+            echo "Deploying $f..."
+            az datafactory pipeline create \
+              --factory-name ${{ secrets.ADF_FACTORY_NAME_STAGING }} \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP_STAGING }} \
+              --name "$(jq -r '.name' $f)" \
+              --pipeline "$(cat $f)"
+          done
+
+      - name: Deploy datasets
+        run: |
+          for f in adf/dataset/*.json; do
+            az datafactory dataset create \
+              --factory-name ${{ secrets.ADF_FACTORY_NAME_STAGING }} \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP_STAGING }} \
+              --name "$(jq -r '.name' $f)" \
+              --properties "$(jq '.properties' $f)"
+          done
+
+      - name: Deploy linked services
+        run: |
+          for f in adf/linkedService/*.json; do
+            az datafactory linked-service create \
+              --factory-name ${{ secrets.ADF_FACTORY_NAME_STAGING }} \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP_STAGING }} \
+              --name "$(jq -r '.name' $f)" \
+              --properties "$(jq '.properties' $f)"
+          done
+
+  # ── Deploy to production ──────────────────────────────────────────────────
+  deploy-prod:
+    name: Deploy to ADF production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy all ADF resources to production
+        run: |
+          for f in adf/linkedService/*.json adf/dataset/*.json adf/pipeline/*.json; do
+            resource_type=$(echo "$f" | cut -d/ -f2)
+            name=$(jq -r '.name' $f)
+            echo "Deploying $resource_type/$name to production..."
+            az datafactory ${resource_type%-s} create \
+              --factory-name ${{ secrets.ADF_FACTORY_NAME_PROD }} \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP_PROD }} \
+              --name "$name" \
+              --properties "$(jq '.properties' $f)"
+          done
